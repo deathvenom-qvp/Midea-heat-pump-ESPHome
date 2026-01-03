@@ -57,12 +57,9 @@ globals:
     initial_value: '0'
 
 esphome:
-  name: "${devicename}"
-  comment: "${description}"
-  friendly_name: "${description}"
-  project:
-    name: "${devicename}.${description}"
-    version: 9.1.0
+  name: upstairs-hvac
+  friendly_name: Upstairs-HVAC
+  name_add_mac_suffix: true
 
 esp32:
   board: esp32dev
@@ -83,13 +80,19 @@ web_server:
 
 ota:
   platform: esphome
+  password: !secret OTA_pin
+  port: 3232
 
 wifi:
-  power_save_mode: none
-  ap:
-    ssid: "${devicename}-setup"
-    password: "heatpump"
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  domain: !secret domain_url
+  fast_connect: True
 
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Upstairs-Hvac Fallback Hotspot"
+    password: !secret wifi_password
 captive_portal:
 
 uart:
@@ -100,7 +103,7 @@ uart:
   stop_bits: 1
 
 modbus:
-  flow_control_pin: 5
+ # flow_control_pin: 5 NOT Used With https://www.amazon.com/dp/B0BKG7SC54?ref_=ppx_hzsearch_conn_dt_b_fed_asin_title_5
   id: heatpump_modbus
 
 modbus_controller:
@@ -120,9 +123,12 @@ select:
     value_type: U_WORD
     optimistic: true
     optionsmap:
-      "Heat": 3
-      "Cool": 2
+      "Off": 0
       "Auto": 1
+      "Cool": 2
+      "Heat": 3
+      "Dry": 4
+      "Fan Only": 5
   - platform: modbus_controller
     modbus_controller_id: "${devicename}"
     name: "Power Input Limitation Type"
