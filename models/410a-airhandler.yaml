@@ -1,3 +1,26 @@
+esphome:
+  name: upstairs-hvac
+  friendly_name: Upstairs-HVAC
+  name_add_mac_suffix: false
+  on_boot:
+    priority: -100  # Run after modbus controller is initialized
+    then:
+      - delay: 5s  # Wait for initial modbus reads
+      - lambda: |-
+          // Set default values if current state is unknown/invalid at boot
+          if (id(${devicename}_operational_mode).state.empty() || id(${devicename}_operational_mode).state == "Unknown") {
+            ESP_LOGW("boot", "Operational Mode state unknown, defaulting to Off");
+            auto call = id(${devicename}_operational_mode).make_call();
+            call.set_option("Off");
+            call.perform();
+          }
+          if (id(${devicename}_fan_mode).state.empty() || id(${devicename}_fan_mode).state == "Unknown") {
+            ESP_LOGW("boot", "Fan Mode state unknown, defaulting to Auto");
+            auto call = id(${devicename}_fan_mode).make_call();
+            call.set_option("Auto");
+            call.perform();
+          }
+
 substitutions:
   devicename: heatpump
   description: Heatpump Controller - Air Handler Configuration
@@ -47,11 +70,6 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
-
-esphome:
-  name: upstairs-hvac
-  friendly_name: Upstairs-HVAC
-  name_add_mac_suffix: true
 
 esp32:
   board: esp32dev
@@ -140,7 +158,6 @@ select:
     icon: "mdi:fan-speed-1"
     address: 0x4
     value_type: U_WORD
-    entity_category: config
     optimistic: true
     optionsmap:
       "Auto": 0
@@ -158,7 +175,7 @@ sensor:
     humidity:
       name: "Adapter_Humidity"
       id: "${devicename}_adapter_humidity"
-    update_interval: 60s
+    update_interval: 10s
     
   - platform: template
     name: "Compressor Starts Per Hour"
@@ -173,6 +190,12 @@ sensor:
     name: Uptime
     id: "${devicename}_uptime"
     icon: mdi:timelapse
+    
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    id: "${devicename}_wifi_signal"
+    icon: mdi:wifi
+    update_interval: 30s
     
   - platform: template
     name: "Freeze Protection Threshold"
@@ -310,7 +333,7 @@ sensor:
     modbus_controller_id: "${devicename}"
     name: "Coil Inlet Temperature"
     id: "${devicename}_coil_inlet_temperature"
-    icon: mdi:temperature-celsius
+    icon: mdi:thermometer
     register_type: holding
     address: 0x68
     value_type: S_WORD
@@ -335,7 +358,7 @@ sensor:
     modbus_controller_id: "${devicename}"
     name: "Coil Outlet Temperature"
     id: "${devicename}_coil_outlet_temperature"
-    icon: mdi:temperature-celsius
+    icon: mdi:thermometer
     register_type: holding
     address: 0x69
     value_type: S_WORD
@@ -360,7 +383,7 @@ sensor:
     modbus_controller_id: "${devicename}"
     name: "Condenser Temperature T3"
     id: "${devicename}_condenser_temperature_t3"
-    icon: mdi:temperature-celsius
+    icon: mdi:thermometer
     register_type: holding
     address: 0x6a
     value_type: S_WORD
@@ -385,7 +408,7 @@ sensor:
     modbus_controller_id: "${devicename}"
     name: "Outdoor Ambient Temperature"
     id: "${devicename}_outdoor_ambient_temperature"
-    icon: mdi:temperature-celsius
+    icon: mdi:thermometer
     register_type: holding
     address: 0x6B
     device_class: "temperature"
@@ -410,7 +433,7 @@ sensor:
     modbus_controller_id: "${devicename}"
     name: "Discharge Temperature"
     id: "${devicename}_discharge_temperature"
-    icon: mdi:temperature-celsius
+    icon: mdi:thermometer
     register_type: holding
     address: 0x6c
     value_type: S_WORD
@@ -435,7 +458,7 @@ sensor:
     modbus_controller_id: "${devicename}"
     name: "Return Air Temperature"
     id: "${devicename}_return_air_temperature"
-    icon: mdi:temperature-celsius
+    icon: mdi:thermometer
     register_type: holding
     address: 0x6d
     value_type: S_WORD
@@ -495,7 +518,7 @@ sensor:
     modbus_controller_id: "${devicename}"
     name: "Refrigerant Liquid Side Temperature T2"
     id: "${devicename}_refrigerant_liquid_side_temperature_t2"
-    icon: mdi:temperature-celsius
+    icon: mdi:thermometer
     register_type: holding
     address: 0x70
     value_type: S_WORD
@@ -520,7 +543,7 @@ sensor:
     modbus_controller_id: "${devicename}"
     name: "Refrigerant Gas Side Temperature T2B"
     id: "${devicename}_refrigerant_gas_side_temperature_t2b"
-    icon: mdi:temperature-celsius
+    icon: mdi:thermometer
     register_type: holding
     address: 0x71
     value_type: S_WORD
@@ -545,7 +568,7 @@ sensor:
     modbus_controller_id: "${devicename}"
     name: "Room Temperature Ta"
     id: "${devicename}_room_temperature_ta"
-    icon: mdi:temperature-celsius
+    icon: mdi:thermometer
     register_type: holding
     address: 0x72
     value_type: S_WORD
@@ -784,7 +807,7 @@ sensor:
     modbus_controller_id: "${devicename}"
     name: "TF module temperature"
     id: "${devicename}_tf_module_temperature"
-    icon: mdi:temperature-celsius
+    icon: mdi:thermometer
     register_type: holding
     address: 0x87
     unit_of_measurement: "°C"
@@ -867,9 +890,9 @@ binary_sensor:
     icon: mdi:thermometer-check
     entity_category: diagnostic
     lambda: |-
-      // Inverted logic: true = no problem, false = problem
+      // device_class: problem - true = problem exists, false = no problem
       float dht_temp = id(${devicename}_adapter_temp).state;
-      return !isnan(dht_temp);
+      return isnan(dht_temp);  // Return true (problem) when sensor reading is NaN
 
   - platform: modbus_controller
     modbus_controller_id: "${devicename}"
@@ -989,14 +1012,13 @@ switch:
 number:
   - platform: modbus_controller
     modbus_controller_id: "${devicename}"
-    name: "Air Temperature Ts"
+    name: "Set Temperature"
     id: "${devicename}_air_temperature_ts"
-    icon: mdi:temperature-celsius
+    icon: mdi:thermometer
     register_type: holding
     address: 0x3
     value_type: U_WORD
     unit_of_measurement: "°C"
-    entity_category: config
     device_class: temperature
     min_value: 17
     max_value: 30
@@ -1471,16 +1493,23 @@ interval:
           bool using_fallback = false;
           
           // Try to get temperature from DHT11 adapter sensor first
+          // NOTE: DHT11 always reads in Celsius, thresholds are in Fahrenheit
           float dht_temp = id(${devicename}_adapter_temp).state;
           if (!isnan(dht_temp)) {
-            current_temp = dht_temp;
+            // Convert DHT11 reading from Celsius to Fahrenheit for threshold comparison
+            current_temp = dht_temp * 1.8 + 32.0;
             using_fallback = false;
-            ESP_LOGD("protection", "Using DHT11 adapter temp: %.1f°F", current_temp);
+            ESP_LOGD("protection", "Using DHT11 adapter temp: %.1f°C (%.1f°F)", dht_temp, current_temp);
           } else {
             // DHT11 failed, try fallback to Return Air Temperature
             float return_temp = id(${devicename}_return_air_temperature).state;
             if (!isnan(return_temp)) {
-              current_temp = return_temp;
+              // Return Air sensor state depends on use_fahrenheit setting
+              if (id(use_fahrenheit)) {
+                current_temp = return_temp;  // Already in Fahrenheit
+              } else {
+                current_temp = return_temp * 1.8 + 32.0;  // Convert from Celsius to Fahrenheit
+              }
               using_fallback = true;
               ESP_LOGW("protection", "DHT11 sensor unavailable, using Return Air temp fallback: %.1f°F", current_temp);
             } else {
