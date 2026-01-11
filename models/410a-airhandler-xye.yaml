@@ -1,0 +1,1227 @@
+# Midea 410a Air Handler - XYE Protocol
+# This configuration uses the XYE serial protocol for communication with Midea air handlers
+# The XYE protocol is a proprietary Midea protocol that differs from standard Modbus
+#
+# Hardware: ESP32 connected to air handler's H1/H2 terminals
+# Protocol: XYE Serial @ 4800 baud, 8N1
+# Packets: 16-byte commands, 32-byte responses
+
+substitutions:
+  devicename: master_hvac
+  friendly_name: "Master HVAC"
+
+globals:
+  # Freeze/Overheat Protection Settings
+  - id: freeze_protection_temp
+    type: float
+    restore_value: no
+    initial_value: '50.0'  # Default: 50°F
+  - id: overheat_protection_temp
+    type: float
+    restore_value: no
+    initial_value: '95.0'  # Default: 95°F
+  - id: protection_mode_active
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: previous_mode_before_protection
+    type: uint8_t
+    restore_value: no
+    initial_value: '0x00'  # Store previous mode to restore after protection
+  - id: protection_enabled
+    type: bool
+    restore_value: yes
+    initial_value: 'true'  # Protection enabled by default
+  # Debug/Sniff Mode
+  - id: sniff_mode_enabled
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: last_rx_data
+    type: uint8_t[32]
+    restore_value: no
+  # Poke & Scan State
+  - id: poke_scan_running
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: poke_scan_byte_index
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+  - id: poke_scan_value
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+  - id: poke_scan_step
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'  # 0=idle, 1=send baseline, 2=wait baseline, 3=send poke, 4=wait poke, 5=compare
+
+esphome:
+  name: master-hvac
+  friendly_name: Master HVAC
+  name_add_mac_suffix: false
+  includes:
+    - xye_protocol.h
+  on_boot:
+    priority: 800
+    then:
+      - lambda: |-
+          // Initialize serial communication for XYE protocol
+          xyeSerial.begin(4800, SERIAL_8N1, RX_PIN, TX_PIN);
+          ESP_LOGI("xye", "XYE Serial initialized on RX:%d TX:%d @ 4800 baud", RX_PIN, TX_PIN);
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# Disable logging via UART (we need the UART for XYE protocol)
+logger:
+  level: INFO
+  baud_rate: 0
+
+# Enable Home Assistant API
+api:
+
+# Web interface for debugging
+web_server:
+  port: 80
+  version: 3
+
+ota:
+  platform: esphome
+  password: !secret OTA_pin
+  port: 3232
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+ # domain: !secret domain_url
+  fast_connect: true
+
+  # Enable fallback hotspot in case wifi connection fails
+  ap:
+    ssid: "${friendly_name} Fallback"
+    password: !secret wifi_password
+
+captive_portal:
+
+# ============================================================================
+# SCRIPTS - XYE Protocol Communication
+# ============================================================================
+
+script:
+  # Send data that was blocked by incoming data
+  - id: xye_wait_send
+    then:
+      - lambda: |-
+          xyeSerial.write(xyeState.waitSendData, 16);
+          xyeState.waitingForResponse = true;
+          xyeState.waitingToSend = false;
+          xyeState.commandSent = true;
+          ESP_LOGD("xye", "Sent delayed command");
+
+  # Construct and send command to air handler
+  - id: xye_send_command
+    then:
+      - lambda: |-
+          if (!xyeState.waitingForResponse) {
+            // Build command packet
+            xyeState.sendData[SEND_MODE] = xyeState.opBytes;
+            xyeState.sendData[SEND_FAN] = xyeState.fanBytes;
+            xyeState.sendData[SEND_TEMP] = xyeState.setTemp;
+            
+            ESP_LOGI("xye", "Preparing command: mode=0x%02X fan=0x%02X temp=%d", 
+                     xyeState.opBytes, xyeState.fanBytes, xyeState.setTemp);
+            
+            // Calculate CRC (sum of all bytes except CRC position, then 0xFF - sum)
+            uint32_t crc = 0;
+            for (uint8_t i = 0; i < 16; i++) {
+              if (i != SEND_CRC) {
+                crc += xyeState.sendData[i];
+              }
+            }
+            xyeState.sendData[SEND_CRC] = 0xFF - (crc & 0xFF);
+            
+            // Check if we can send immediately
+            if (xyeSerial.available() == 0) {
+              // SNIFF MODE: Log outgoing packet
+              if (id(sniff_mode_enabled)) {
+                ESP_LOGW("SNIFF", "========== TX PACKET (16 bytes) ==========");
+                ESP_LOGW("SNIFF", "RAW: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                         xyeState.sendData[0], xyeState.sendData[1], xyeState.sendData[2], xyeState.sendData[3],
+                         xyeState.sendData[4], xyeState.sendData[5], xyeState.sendData[6], xyeState.sendData[7],
+                         xyeState.sendData[8], xyeState.sendData[9], xyeState.sendData[10], xyeState.sendData[11],
+                         xyeState.sendData[12], xyeState.sendData[13], xyeState.sendData[14], xyeState.sendData[15]);
+                ESP_LOGW("SNIFF", "DECODED: Mode=0x%02X Fan=0x%02X Temp=%d CRC=0x%02X",
+                         xyeState.sendData[SEND_MODE], xyeState.sendData[SEND_FAN], 
+                         xyeState.sendData[SEND_TEMP], xyeState.sendData[SEND_CRC]);
+                ESP_LOGW("SNIFF", "===========================================");
+              }
+              xyeSerial.write(xyeState.sendData, SEND_LEN);
+              ESP_LOGI("xye", "Command sent successfully");
+              xyeState.waitingForResponse = true;
+              xyeState.commandSent = true;
+            } else {
+              // Buffer is not empty, queue for later
+              ESP_LOGW("xye", "Serial buffer not empty, queuing command");
+              std::memcpy(xyeState.waitSendData, xyeState.sendData, 16);
+              xyeState.waitingToSend = true;
+            }
+            
+            xyeState.newInput = false;
+            xyeState.sendTimeCount = 0;
+          }
+
+# ============================================================================
+# SENSORS - Temperature and System Status
+# ============================================================================
+
+sensor:
+  # XYE Protocol Updater - Reads responses from air handler
+  - platform: template
+    name: "XYE Updater"
+    id: xye_updater
+    internal: true
+    update_interval: 1s
+    lambda: |-
+      uint8_t resp = xyeSerial.available();
+      xyeState.doneReading = false;
+      
+      if (resp > 0) {
+        ESP_LOGD("xye", "Serial buffer has %d bytes", resp);
+        
+        if (resp == 32) {
+          // Full response received
+          ESP_LOGD("xye", "Reading 32-byte response...");
+          for (uint8_t i = 0; i < resp; i++) {
+            if (i < 30) {
+              xyeState.recData[i] = xyeSerial.read();
+            } else {
+              xyeSerial.read();  // Discard extra bytes
+            }
+          }
+          xyeState.doneReading = true;
+          xyeState.waitingForResponse = false;
+          xyeState.prevResp = 0;
+          
+        } else if (xyeState.prevResp == resp) {
+          // Stale data - same size for 2 cycles, discard it
+          for (uint8_t i = 0; i < resp; i++) {
+            xyeSerial.read();
+          }
+          ESP_LOGW("xye", "Discarded %d bytes of stale data", resp);
+          xyeState.waitingForResponse = false;
+          xyeState.prevResp = 0;
+          xyeState.doneReading = true;
+          
+        } else {
+          // Partial data - wait for more
+          ESP_LOGD("xye", "Partial response (%d bytes), waiting...", resp);
+          xyeState.prevResp = resp;
+        }
+      }
+      
+      // Timeout handling
+      if (xyeState.waitingForResponse) {
+        if (xyeState.waitCount > 2) {
+          ESP_LOGW("xye", "Response timeout after 3 cycles");
+          xyeState.waitingForResponse = false;
+          xyeState.waitCount = 0;
+          xyeState.doneReading = true;
+        } else {
+          xyeState.waitCount++;
+        }
+      }
+      
+      // Process received data
+      if (xyeState.doneReading) {
+        // SNIFF MODE: Detailed packet logging
+        if (id(sniff_mode_enabled)) {
+          ESP_LOGW("SNIFF", "========== RX PACKET (30 bytes) ==========");
+          ESP_LOGW("SNIFF", "RAW: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                   xyeState.recData[0], xyeState.recData[1], xyeState.recData[2], xyeState.recData[3],
+                   xyeState.recData[4], xyeState.recData[5], xyeState.recData[6], xyeState.recData[7],
+                   xyeState.recData[8], xyeState.recData[9], xyeState.recData[10], xyeState.recData[11],
+                   xyeState.recData[12], xyeState.recData[13], xyeState.recData[14], xyeState.recData[15]);
+          ESP_LOGW("SNIFF", "     %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                   xyeState.recData[16], xyeState.recData[17], xyeState.recData[18], xyeState.recData[19],
+                   xyeState.recData[20], xyeState.recData[21], xyeState.recData[22], xyeState.recData[23],
+                   xyeState.recData[24], xyeState.recData[25], xyeState.recData[26], xyeState.recData[27],
+                   xyeState.recData[28], xyeState.recData[29]);
+          ESP_LOGW("SNIFF", "DECODED: Header=0x%02X Mode=0x%02X Fan=0x%02X Temp=%d",
+                   xyeState.recData[0], xyeState.recData[REC_MODE], xyeState.recData[REC_FAN], xyeState.recData[REC_TEMP]);
+          ESP_LOGW("SNIFF", "TEMPS: T1=%d T2A=%d T2B=%d T3=%d",
+                   xyeState.recData[T1_INDEX], xyeState.recData[T2A_INDEX], 
+                   xyeState.recData[T2B_INDEX], xyeState.recData[T3_INDEX]);
+          ESP_LOGW("SNIFF", "ERRORS: E1=%d E2=%d", xyeState.recData[ERR1_INDEX], xyeState.recData[ERR2_INDEX]);
+          
+          // Check for changes from last packet
+          bool hasChanges = false;
+          for (uint8_t i = 0; i < 30; i++) {
+            if (xyeState.recData[i] != id(last_rx_data)[i]) {
+              ESP_LOGW("SNIFF", "CHANGE: Byte[%d] 0x%02X -> 0x%02X", i, id(last_rx_data)[i], xyeState.recData[i]);
+              hasChanges = true;
+            }
+          }
+          if (!hasChanges) {
+            ESP_LOGD("SNIFF", "No changes from previous packet");
+          }
+          
+          // Store for next comparison
+          for (uint8_t i = 0; i < 30; i++) {
+            id(last_rx_data)[i] = xyeState.recData[i];
+          }
+          ESP_LOGW("SNIFF", "===========================================");
+        }
+        
+        // DEBUG: Log first 16 bytes of received data
+        ESP_LOGI("xye", "RX: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                 xyeState.recData[0], xyeState.recData[1], xyeState.recData[2], xyeState.recData[3],
+                 xyeState.recData[4], xyeState.recData[5], xyeState.recData[6], xyeState.recData[7],
+                 xyeState.recData[8], xyeState.recData[9], xyeState.recData[10], xyeState.recData[11],
+                 xyeState.recData[12], xyeState.recData[13], xyeState.recData[14], xyeState.recData[15]);
+        
+        if (!xyeState.commandSent && !xyeState.newInput) {
+          // Validate response header - only check byte 0 is 0xAA (start byte)
+          // The old check was too strict for some units
+          bool validHeader = (xyeState.recData[0] == 0xAA);
+          
+          // Log expected vs actual for debugging
+          if (!validHeader) {
+            ESP_LOGW("xye", "Expected start byte 0xAA, got 0x%02X", xyeState.recData[0]);
+          }
+          
+          if (validHeader) {
+            xyeState.fanBytes = xyeState.recData[REC_FAN];
+            xyeState.opBytes = xyeState.recData[REC_MODE];
+            xyeState.setTemp = xyeState.recData[REC_TEMP];
+            ESP_LOGI("xye", "Updated state: mode=0x%02X fan=0x%02X temp=%d", 
+                     xyeState.opBytes, xyeState.fanBytes, xyeState.setTemp);
+          } else {
+            ESP_LOGW("xye", "Invalid response header, discarding");
+          }
+        } else {
+          xyeState.commandSent = false;
+          ESP_LOGD("xye", "Ignoring response after command/input");
+        }
+        
+        // Send any queued commands
+        if (xyeState.waitingToSend) {
+          ESP_LOGI("xye", "Sending queued command...");
+          id(xye_wait_send).execute();
+        }
+      }
+      
+      // Check if we need to send new data (with debounce)
+      if (xyeState.newInput) {
+        if (xyeState.sendTimeCount > 4) {
+          xyeState.sendTimeCount = 0;
+          id(xye_send_command).execute();
+        } else {
+          xyeState.sendTimeCount++;
+        }
+      }
+      
+      return 0;
+
+  # XYE Query Sender - Polls air handler status every 15 seconds
+  - platform: template
+    name: "XYE Querier"
+    id: xye_querier
+    internal: true
+    update_interval: 15s
+    lambda: |-
+      ESP_LOGD("xye", "Query check: newInput=%s waitingForResponse=%s",
+               xyeState.newInput ? "true" : "false",
+               xyeState.waitingForResponse ? "true" : "false");
+               
+      if (!xyeState.newInput && !xyeState.waitingForResponse) {
+        if (!xyeState.waitingToSend && xyeSerial.available() == 0) {
+          xyeSerial.write(xyeState.queryData, 16);
+          ESP_LOGD("xye", "Sent query packet");
+          xyeState.waitingForResponse = true;
+        } else {
+          ESP_LOGD("xye", "Query skipped - busy");
+        }
+      }
+      return 0;
+
+  # Temperature Sensors from XYE Protocol
+  - platform: template
+    name: "Inlet Air Temperature (T1)"
+    id: "${devicename}_inlet_air_temp"
+    unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    icon: mdi:thermometer
+    accuracy_decimals: 0
+    update_interval: 2s
+    lambda: |-
+      return xyeState.recData[T1_INDEX];
+
+  - platform: template
+    name: "Coil A Temperature (T2A)"
+    id: "${devicename}_coil_a_temp"
+    unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    icon: mdi:thermometer-water
+    accuracy_decimals: 0
+    update_interval: 2s
+    lambda: |-
+      return xyeState.recData[T2A_INDEX];
+
+  - platform: template
+    name: "Coil B Temperature (T2B)"
+    id: "${devicename}_coil_b_temp"
+    unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    icon: mdi:thermometer-water
+    accuracy_decimals: 0
+    update_interval: 2s
+    lambda: |-
+      return xyeState.recData[T2B_INDEX];
+
+  - platform: template
+    name: "Outside/Exhaust Temperature (T3)"
+    id: "${devicename}_outside_temp"
+    unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    icon: mdi:thermometer-lines
+    accuracy_decimals: 0
+    update_interval: 2s
+    lambda: |-
+      return xyeState.recData[T3_INDEX];
+
+  # Additional Response Data (from mdrobnak/esphome midea_xye research)
+  - platform: template
+    name: "Current Draw"
+    id: "${devicename}_current_draw"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    icon: mdi:current-ac
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: 5s
+    lambda: |-
+      // Often reads 255 (0xFF) when invalid/unsupported
+      uint8_t raw = xyeState.recData[CURRENT_INDEX];
+      if (raw == 255) return NAN;
+      return raw * 0.1;  // Assumed 0.1A resolution
+
+  - platform: template
+    name: "Mode Flags"
+    id: "${devicename}_mode_flags"
+    icon: mdi:flag
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      // Byte 20: 0x01=ECO, 0x02=AUX_HEAT, 0x04=SWING, 0x88=VENT
+      return xyeState.recData[MODE_FLAGS_IDX];
+
+  - platform: template
+    name: "Operation Flags"
+    id: "${devicename}_operation_flags"
+    icon: mdi:information
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      // Byte 21: 0x04=WATER_PUMP, 0x80=WATER_LOCK
+      return xyeState.recData[OP_FLAGS_IDX];
+
+  - platform: template
+    name: "Protection Flags"
+    id: "${devicename}_protection_flags"
+    icon: mdi:shield-alert
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      // Bytes 24-25: Protection status
+      return (xyeState.recData[PROT2_INDEX] << 8) | xyeState.recData[PROT1_INDEX];
+
+  - platform: template
+    name: "Capabilities"
+    id: "${devicename}_capabilities"
+    icon: mdi:cog
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: |-
+      // Byte 7: 0x80=ext_temp, 0x10=swing
+      return xyeState.recData[7];
+
+  # Calculated/Derived Sensors
+  - platform: template
+    name: "Coil Temperature Differential"
+    id: "${devicename}_coil_temp_diff"
+    unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    icon: mdi:thermometer-chevron-up
+    accuracy_decimals: 1
+    update_interval: 5s
+    lambda: |-
+      float coilA = xyeState.recData[T2A_INDEX];
+      float coilB = xyeState.recData[T2B_INDEX];
+      return abs(coilA - coilB);
+
+  - platform: template
+    name: "Supply Air Delta T"
+    id: "${devicename}_supply_delta_t"
+    unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    icon: mdi:delta
+    accuracy_decimals: 1
+    update_interval: 5s
+    lambda: |-
+      float inlet = xyeState.recData[T1_INDEX];
+      float coilAvg = (xyeState.recData[T2A_INDEX] + xyeState.recData[T2B_INDEX]) / 2.0;
+      return coilAvg - inlet;
+
+  # System Status Sensors
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    id: "${devicename}_wifi_signal"
+    icon: mdi:wifi
+    update_interval: 30s
+
+  - platform: uptime
+    name: "Uptime"
+    id: "${devicename}_uptime_sensor"
+    update_interval: 60s
+
+  # Freeze/Overheat Protection Threshold Sensors
+  - platform: template
+    name: "Freeze Protection Threshold"
+    id: "${devicename}_freeze_protection_threshold"
+    icon: mdi:snowflake-alert
+    accuracy_decimals: 0
+    unit_of_measurement: "°F"
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: |-
+      return id(freeze_protection_temp);
+      
+  - platform: template
+    name: "Overheat Protection Threshold"
+    id: "${devicename}_overheat_protection_threshold"
+    icon: mdi:fire-alert
+    accuracy_decimals: 0
+    unit_of_measurement: "°F"
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: |-
+      return id(overheat_protection_temp);
+
+  # DHT11 sensor on adapter board for ambient temperature monitoring
+  # Used as fallback for freeze/overheat protection if XYE temps fail
+  - platform: dht
+    pin: GPIO13
+    model: DHT11
+    temperature:
+      name: "Adapter Temperature"
+      id: "${devicename}_adapter_temp"
+      unit_of_measurement: "°F"
+      device_class: temperature
+      accuracy_decimals: 1
+      filters:
+        - lambda: return x * 9.0 / 5.0 + 32.0;  # Convert C to F
+    humidity:
+      name: "Adapter Humidity"
+      id: "${devicename}_adapter_humidity"
+      unit_of_measurement: "%"
+      device_class: humidity
+      accuracy_decimals: 0
+    update_interval: 15s
+
+# ============================================================================
+# TEXT SENSORS - Status and Diagnostics
+# ============================================================================
+
+text_sensor:
+  - platform: template
+    name: "Error Codes"
+    id: "${devicename}_error_codes"
+    icon: mdi:alert-circle
+    update_interval: 5s
+    lambda: |-
+      uint8_t e1 = xyeState.recData[ERR1_INDEX];  // Byte 22
+      uint8_t e2 = xyeState.recData[ERR2_INDEX];  // Byte 23
+      if (e1 == 0 && e2 == 0) {
+        return {"No Errors"};
+      }
+      // Decode known error codes (varies by unit, these are common)
+      auto decode = [](uint8_t e) -> std::string {
+        switch(e) {
+          case 1: return "Comm";      // Indoor/outdoor communication
+          case 2: return "IndoorT";   // Indoor temp sensor
+          case 3: return "CoilT";     // Coil temp sensor
+          case 4: return "OutdoorT";  // Outdoor temp sensor
+          case 5: return "OutCoilT";  // Outdoor coil sensor
+          case 6: return "CompOL";    // Compressor overload
+          case 7: return "CompOC";    // Compressor overcurrent
+          case 8: return "HighP";     // High pressure
+          case 9: return "LowP";      // Low pressure
+          case 10: return "Phase";    // Phase error
+          case 11: return "OutFan";   // Outdoor fan error
+          case 12: return "IndFan";   // Indoor fan error
+          case 13: return "EEPROM";   // EEPROM error
+          case 14: return "Voltage";  // Power voltage error
+          case 15: return "Freeze";   // Freeze protection
+          default: return "E" + std::to_string(e);
+        }
+      };
+      if (e2 == 0) return {decode(e1)};
+      return {decode(e1) + "+" + decode(e2)};
+
+  - platform: template
+    name: "Active Modes"
+    id: "${devicename}_active_modes"
+    icon: mdi:format-list-bulleted
+    update_interval: 5s
+    lambda: |-
+      uint8_t flags = xyeState.recData[MODE_FLAGS_IDX];
+      std::string modes;
+      if (flags == 0) return {"Normal"};
+      if (flags & 0x01) modes += "ECO ";      // Sleep/ECO mode
+      if (flags & 0x02) modes += "BOOST ";    // Aux heat/Boost
+      if (flags & 0x04) modes += "SWING ";    // Swing enabled
+      if (flags & 0x80) modes += "VENT ";     // Ventilation
+      if (modes.empty()) {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "0x%02X", flags);
+        modes = buf;
+      }
+      return {modes};
+
+  - platform: template
+    name: "System Status"
+    id: "${devicename}_system_status"
+    icon: mdi:information-outline
+    update_interval: 5s
+    lambda: |-
+      uint8_t flags = xyeState.recData[OP_FLAGS_IDX];
+      std::string status;
+      if (flags & 0x04) status += "PUMP ";     // Water pump active
+      if (flags & 0x80) status += "W-LOCK ";   // Water lock active
+      if (status.empty()) status = "Idle";
+      return {status};
+
+  - platform: template
+    name: "Raw Data (Debug)"
+    id: "${devicename}_raw_data"
+    icon: mdi:code-array
+    entity_category: diagnostic
+    update_interval: 15s
+    lambda: |-
+      std::ostringstream oss;
+      oss << std::uppercase << std::hex << std::setfill('0');
+      for (uint8_t i = 0; i < 30; i++) {
+        if (i > 0) oss << ' ';
+        oss << "0x" << std::setw(2) << static_cast<int>(xyeState.recData[i]);
+      }
+      return {oss.str()};
+
+  - platform: template
+    name: "Uptime Formatted"
+    id: "${devicename}_uptime_human"
+    icon: mdi:clock-start
+    update_interval: 60s
+    lambda: |-
+      uint32_t seconds = id(${devicename}_uptime_sensor).state;
+      uint32_t days = seconds / 86400;
+      seconds %= 86400;
+      uint32_t hours = seconds / 3600;
+      seconds %= 3600;
+      uint32_t minutes = seconds / 60;
+      seconds %= 60;
+      
+      std::string result;
+      if (days > 0) result += std::to_string(days) + "d ";
+      if (hours > 0) result += std::to_string(hours) + "h ";
+      if (minutes > 0) result += std::to_string(minutes) + "m ";
+      result += std::to_string(seconds) + "s";
+      return result;
+
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+      id: "${devicename}_ip_address"
+      icon: mdi:ip-network
+
+  - platform: version
+    name: "ESPHome Version"
+    id: "${devicename}_esphome_version"
+    hide_timestamp: true
+
+# ============================================================================
+# SELECT - Operating Mode and Fan Mode
+# ============================================================================
+
+select:
+  - platform: template
+    name: "Operating Mode"
+    id: "${devicename}_operating_mode"
+    icon: mdi:hvac
+    update_interval: 2s
+    options:
+      - 'Off'
+      - 'Auto'
+      - 'Cool'
+      - 'Dry'
+      - 'Heat'
+      - 'Fan Only'
+    lambda: |-
+      switch (xyeState.opBytes) {
+        case 0x00: return {"Off"};
+        case 0x80: return {"Auto"};  // Some units use 0x80
+        case 0x91: return {"Auto"};  // Other units use 0x91
+        case 0x88: return {"Cool"};
+        case 0x82: return {"Dry"};
+        case 0x84: return {"Heat"};
+        case 0x81: return {"Fan Only"};
+        default:   return {"Off"};
+      }
+    set_action:
+      - lambda: |-
+          uint8_t newOpBytes = 0x00;
+          if (x == "Off")       newOpBytes = 0x00;
+          else if (x == "Auto") newOpBytes = 0x91;
+          else if (x == "Cool") newOpBytes = 0x88;
+          else if (x == "Dry")  newOpBytes = 0x82;
+          else if (x == "Heat") newOpBytes = 0x84;
+          else if (x == "Fan Only") newOpBytes = 0x81;
+          else {
+            ESP_LOGW("xye", "Invalid mode: %s, defaulting to Off", x.c_str());
+            newOpBytes = 0x00;
+          }
+          
+          if (xyeState.opBytes != newOpBytes) {
+            xyeState.opBytes = newOpBytes;
+            xyeState.newInput = true;
+            ESP_LOGI("xye", "Mode changed to %s (0x%02X)", x.c_str(), newOpBytes);
+          }
+
+  - platform: template
+    name: "Fan Mode"
+    id: "${devicename}_fan_mode"
+    icon: mdi:fan
+    update_interval: 2s
+    options:
+      - 'Auto'
+      - 'High'
+      - 'Medium'
+      - 'Medium-Low'
+      - 'Low'
+    lambda: |-
+      switch (xyeState.fanBytes) {
+        case 0x80: return {"Auto"};
+        case 0x01: return {"High"};
+        case 0x02: return {"Medium"};
+        case 0x03: return {"Medium-Low"};  // Some units support this
+        case 0x04: return {"Low"};  // 0x04 per Flachzange fix, not 0x03
+        default:   return {"Auto"};
+      }
+    set_action:
+      - lambda: |-
+          uint8_t newFanBytes = 0x80;
+          if (x == "Auto")        newFanBytes = 0x80;
+          else if (x == "High")   newFanBytes = 0x01;
+          else if (x == "Medium") newFanBytes = 0x02;
+          else if (x == "Medium-Low") newFanBytes = 0x03;  // Some units
+          else if (x == "Low")    newFanBytes = 0x04;  // 0x04 per Flachzange fix
+          else {
+            ESP_LOGW("xye", "Invalid fan mode: %s, defaulting to Auto", x.c_str());
+            newFanBytes = 0x80;
+          }
+          
+          if (xyeState.fanBytes != newFanBytes) {
+            xyeState.fanBytes = newFanBytes;
+            xyeState.newInput = true;
+            ESP_LOGI("xye", "Fan mode changed to %s (0x%02X)", x.c_str(), newFanBytes);
+          }
+
+# ============================================================================
+# BINARY SENSORS - System Status
+# ============================================================================
+
+binary_sensor:
+  - platform: template
+    name: "Compressor Running"
+    id: "${devicename}_compressor_running"
+    icon: mdi:pump
+    device_class: running
+    lambda: |-
+      // Compressor is running if coil temp differs significantly from inlet
+      float inlet = xyeState.recData[T1_INDEX];
+      float coilAvg = (xyeState.recData[T2A_INDEX] + xyeState.recData[T2B_INDEX]) / 2.0;
+      float diff = abs(coilAvg - inlet);
+      return diff > 10.0;  // More than 10°F difference indicates active operation
+
+  - platform: template
+    name: "System Active"
+    id: "${devicename}_system_active"
+    icon: mdi:power
+    device_class: running
+    lambda: |-
+      return xyeState.opBytes != 0x00;
+
+  - platform: template
+    name: "Has Error"
+    id: "${devicename}_has_error"
+    icon: mdi:alert
+    device_class: problem
+    lambda: |-
+      return (xyeState.recData[ERR1_INDEX] != 0 || xyeState.recData[ERR2_INDEX] != 0);
+
+  - platform: status
+    name: "ESP Status"
+    id: "${devicename}_esp_status"
+
+  - platform: template
+    name: "Temperature Protection Active"
+    id: "${devicename}_temperature_protection_active"
+    device_class: safety
+    icon: mdi:shield-alert
+    lambda: |-
+      return id(protection_mode_active);
+
+  - platform: template
+    name: "Sniff Mode Active"
+    id: "${devicename}_sniff_mode_active"
+    icon: mdi:bug
+    entity_category: diagnostic
+    lambda: |-
+      return id(sniff_mode_enabled);
+
+  - platform: template
+    name: "Poke & Scan Running"
+    id: "${devicename}_poke_scan_active"
+    icon: mdi:magnify-scan
+    entity_category: diagnostic
+    lambda: |-
+      return id(poke_scan_running);
+
+# ============================================================================
+# BUTTON - Manual Commands
+# ============================================================================
+
+button:
+  - platform: restart
+    name: "Restart ESP"
+    id: "${devicename}_restart"
+    icon: mdi:restart
+    entity_category: config
+
+  - platform: template
+    name: "Force Query"
+    id: "${devicename}_force_query"
+    icon: mdi:refresh
+    entity_category: diagnostic
+    on_press:
+      - lambda: |-
+          if (xyeSerial.available() == 0) {
+            xyeSerial.write(xyeState.queryData, 16);
+            xyeState.waitingForResponse = true;
+            ESP_LOGI("xye", "Manual query sent");
+          }
+
+  - platform: template
+    name: "Poke & Scan Start"
+    id: "${devicename}_poke_scan_start"
+    icon: mdi:magnify-scan
+    entity_category: diagnostic
+    on_press:
+      - lambda: |-
+          if (!id(poke_scan_running)) {
+            id(poke_scan_running) = true;
+            id(poke_scan_byte_index) = 1;  // Start at byte 1 (skip header)
+            id(poke_scan_value) = 0;
+            id(poke_scan_step) = 1;
+            ESP_LOGW("POKE", "========== POKE & SCAN STARTED ==========");
+            ESP_LOGW("POKE", "Will test bytes 1-15 with values 0x00, 0x01, 0x80, 0xFF");
+            ESP_LOGW("POKE", "Check logs for response changes!");
+          } else {
+            ESP_LOGW("POKE", "Poke & Scan already running!");
+          }
+
+  - platform: template
+    name: "Poke & Scan Stop"
+    id: "${devicename}_poke_scan_stop"
+    icon: mdi:stop
+    entity_category: diagnostic
+    on_press:
+      - lambda: |-
+          if (id(poke_scan_running)) {
+            id(poke_scan_running) = false;
+            ESP_LOGW("POKE", "========== POKE & SCAN STOPPED ==========");
+          }
+
+# ============================================================================
+# SWITCH - Quick Controls
+# ============================================================================
+
+switch:
+  - platform: template
+    name: "Power"
+    id: "${devicename}_power"
+    icon: mdi:power
+    lambda: |-
+      return xyeState.opBytes != 0x00;
+    turn_on_action:
+      - lambda: |-
+          if (xyeState.opBytes == 0x00) {
+            xyeState.opBytes = 0x91;  // Default to Auto mode when turning on
+            xyeState.newInput = true;
+            ESP_LOGI("xye", "Power ON - Auto mode");
+          }
+    turn_off_action:
+      - lambda: |-
+          if (xyeState.opBytes != 0x00) {
+            xyeState.opBytes = 0x00;
+            xyeState.newInput = true;
+            ESP_LOGI("xye", "Power OFF");
+          }
+
+  - platform: template
+    name: "Temperature Protection Enabled"
+    id: "${devicename}_protection_enabled"
+    icon: mdi:shield-home
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    lambda: |-
+      return id(protection_enabled);
+    turn_on_action:
+      - lambda: |-
+          id(protection_enabled) = true;
+          ESP_LOGI("protection", "Temperature protection ENABLED");
+    turn_off_action:
+      - lambda: |-
+          id(protection_enabled) = false;
+          id(protection_mode_active) = false;
+          ESP_LOGI("protection", "Temperature protection DISABLED");
+
+  - platform: template
+    name: "Sniff XYE Traffic"
+    id: "${devicename}_sniff_mode"
+    icon: mdi:bug
+    entity_category: diagnostic
+    restore_mode: RESTORE_DEFAULT_OFF
+    optimistic: true
+    lambda: |-
+      return id(sniff_mode_enabled);
+    turn_on_action:
+      - lambda: |-
+          id(sniff_mode_enabled) = true;
+          // Initialize last_rx_data
+          for (uint8_t i = 0; i < 32; i++) {
+            id(last_rx_data)[i] = 0;
+          }
+          ESP_LOGW("SNIFF", "========== SNIFF MODE ENABLED ==========");
+          ESP_LOGW("SNIFF", "Logging all XYE TX/RX packets with decode");
+          ESP_LOGW("SNIFF", "Changes from previous packets highlighted");
+    turn_off_action:
+      - lambda: |-
+          id(sniff_mode_enabled) = false;
+          ESP_LOGW("SNIFF", "========== SNIFF MODE DISABLED ==========");
+
+# ============================================================================
+# NUMBER - Protection Thresholds
+# ============================================================================
+
+number:
+  - platform: template
+    name: "Freeze Protection Temperature"
+    id: "${devicename}_freeze_temp_setting"
+    icon: mdi:snowflake-thermometer
+    unit_of_measurement: "°F"
+    entity_category: config
+    mode: box
+    min_value: 32
+    max_value: 60
+    step: 1
+    lambda: |-
+      return id(freeze_protection_temp);
+    set_action:
+      - lambda: |-
+          id(freeze_protection_temp) = x;
+          ESP_LOGI("protection", "Freeze protection threshold set to %.0f°F", x);
+
+  - platform: template
+    name: "Overheat Protection Temperature"
+    id: "${devicename}_overheat_temp_setting"
+    icon: mdi:thermometer-alert
+    unit_of_measurement: "°F"
+    entity_category: config
+    mode: box
+    min_value: 85
+    max_value: 110
+    step: 1
+    lambda: |-
+      return id(overheat_protection_temp);
+    set_action:
+      - lambda: |-
+          id(overheat_protection_temp) = x;
+          ESP_LOGI("protection", "Overheat protection threshold set to %.0f°F", x);
+
+  - platform: template
+    name: "Temperature Setpoint"
+    id: "${devicename}_setpoint"
+    icon: mdi:thermometer-check
+    unit_of_measurement: "°F"
+    device_class: temperature
+    mode: box
+    min_value: 60
+    max_value: 86
+    step: 1
+    update_interval: 2s
+    lambda: |-
+      return xyeState.setTemp;
+    set_action:
+      - lambda: |-
+          if (xyeState.setTemp != static_cast<uint8_t>(x)) {
+            xyeState.setTemp = static_cast<uint8_t>(x);
+            xyeState.newInput = true;
+            ESP_LOGI("xye", "Setpoint changed to %d°F", xyeState.setTemp);
+          }
+
+# ============================================================================
+# INTERVAL - Freeze/Overheat Protection (runs independently)
+# ============================================================================
+
+interval:
+  - interval: 30s
+    then:
+      - lambda: |-
+          // Freeze Protection and Overheat Protection
+          // This runs independently of WiFi/Home Assistant connection
+          
+          if (!id(protection_enabled)) {
+            return;  // Protection disabled
+          }
+          
+          // Temperature source priority:
+          // 1. DHT11 adapter temperature (if available and valid)
+          // 2. XYE Inlet Air Temperature (T1) as fallback
+          
+          float current_temp = NAN;
+          const char* temp_source = "unknown";
+          
+          // First try DHT11 (preferred - measures actual room/adapter temp)
+          if (id(${devicename}_adapter_temp).has_state()) {
+            float dht_temp = id(${devicename}_adapter_temp).state;
+            // Validate DHT11 reading (reasonable range for indoor temps in °F)
+            if (!isnan(dht_temp) && dht_temp > 0 && dht_temp < 130) {
+              current_temp = dht_temp;
+              temp_source = "DHT11";
+            }
+          }
+          
+          // Fallback to XYE T1 inlet air temp if DHT11 not available/valid
+          if (isnan(current_temp)) {
+            float xye_temp = xyeState.recData[T1_INDEX];
+            // Validate XYE reading (0, 255, or out of range = invalid)
+            if (xye_temp > 10 && xye_temp < 150 && xye_temp != 255) {
+              current_temp = xye_temp;
+              temp_source = "XYE-T1";
+            }
+          }
+          
+          // No valid temperature from either source
+          if (isnan(current_temp)) {
+            ESP_LOGW("protection", "No valid temperature from DHT11 or XYE, skipping protection check");
+            return;
+          }
+          
+          ESP_LOGD("protection", "Using %s temp: %.1f°F", temp_source, current_temp);
+          
+          // Get current mode
+          uint8_t current_mode = xyeState.opBytes;
+          
+          // Freeze Protection: If temp falls below minimum, switch to heat
+          if (current_temp < id(freeze_protection_temp)) {
+            ESP_LOGW("protection", "FREEZE PROTECTION ACTIVATED (%s): %.0f°F < %.0f°F", 
+                     temp_source, current_temp, id(freeze_protection_temp));
+            
+            // Store previous mode if not already in protection mode
+            if (!id(protection_mode_active) && current_mode != 0x00) {
+              id(previous_mode_before_protection) = current_mode;
+            }
+            
+            // Switch to Heat mode (0x84) if not already heating
+            if (current_mode != 0x84) {
+              xyeState.opBytes = 0x84;  // Heat mode
+              xyeState.newInput = true;
+              id(protection_mode_active) = true;
+              ESP_LOGI("protection", "Switched to HEAT mode for freeze protection");
+            }
+          }
+          // Overheat Protection: If temp exceeds maximum, switch to cool
+          else if (current_temp > id(overheat_protection_temp)) {
+            ESP_LOGW("protection", "OVERHEAT PROTECTION ACTIVATED (%s): %.0f°F > %.0f°F", 
+                     temp_source, current_temp, id(overheat_protection_temp));
+            
+            // Store previous mode if not already in protection mode
+            if (!id(protection_mode_active) && current_mode != 0x00) {
+              id(previous_mode_before_protection) = current_mode;
+            }
+            
+            // Switch to Cool mode (0x88) if not already cooling
+            if (current_mode != 0x88) {
+              xyeState.opBytes = 0x88;  // Cool mode
+              xyeState.newInput = true;
+              id(protection_mode_active) = true;
+              ESP_LOGI("protection", "Switched to COOL mode for overheat protection");
+            }
+          }
+          // Temperature is within safe range
+          else {
+            if (id(protection_mode_active)) {
+              ESP_LOGI("protection", "Temperature back to safe range: %.0f°F", current_temp);
+              
+              // Optionally restore previous mode (if it wasn't Off)
+              if (id(previous_mode_before_protection) != 0x00) {
+                xyeState.opBytes = id(previous_mode_before_protection);
+                xyeState.newInput = true;
+                ESP_LOGI("protection", "Restored previous mode: 0x%02X", id(previous_mode_before_protection));
+              }
+              
+              id(protection_mode_active) = false;
+            }
+          }
+
+  # Poke & Scan - Automated register testing
+  - interval: 3s
+    then:
+      - lambda: |-
+          if (!id(poke_scan_running)) {
+            return;  // Not running
+          }
+          
+          // Test values to try for each byte position
+          static const uint8_t testValues[] = {0x00, 0x01, 0x02, 0x03, 0x80, 0x81, 0xFF};
+          static const uint8_t numTestValues = 7;
+          static uint8_t baselineData[30];
+          
+          uint8_t step = id(poke_scan_step);
+          uint8_t byteIdx = id(poke_scan_byte_index);
+          uint8_t valIdx = id(poke_scan_value);
+          
+          switch (step) {
+            case 1: {
+              // Step 1: Send baseline query and wait
+              if (xyeSerial.available() == 0 && !xyeState.waitingForResponse) {
+                ESP_LOGW("POKE", "--- Testing Byte[%d] ---", byteIdx);
+                xyeSerial.write(xyeState.queryData, 16);
+                xyeState.waitingForResponse = true;
+                id(poke_scan_step) = 2;
+              }
+              break;
+            }
+            
+            case 2: {
+              // Step 2: Wait for baseline response
+              if (xyeState.doneReading) {
+                // Store baseline
+                for (uint8_t i = 0; i < 30; i++) {
+                  baselineData[i] = xyeState.recData[i];
+                }
+                ESP_LOGD("POKE", "Baseline captured");
+                id(poke_scan_step) = 3;
+              }
+              break;
+            }
+            
+            case 3: {
+              // Step 3: Send poke command with modified byte
+              if (xyeSerial.available() == 0 && !xyeState.waitingForResponse) {
+                uint8_t testVal = testValues[valIdx];
+                
+                // Build poke packet (copy query, modify target byte)
+                uint8_t pokePacket[16];
+                std::memcpy(pokePacket, xyeState.sendData, 16);
+                
+                // Only modify bytes 1-10 (command payload area)
+                if (byteIdx >= 1 && byteIdx <= 10) {
+                  pokePacket[byteIdx] = testVal;
+                  
+                  // Recalculate CRC
+                  uint32_t crc = 0;
+                  for (uint8_t i = 0; i < 16; i++) {
+                    if (i != SEND_CRC) {
+                      crc += pokePacket[i];
+                    }
+                  }
+                  pokePacket[SEND_CRC] = 0xFF - (crc & 0xFF);
+                  
+                  ESP_LOGW("POKE", "SEND: Byte[%d] = 0x%02X", byteIdx, testVal);
+                  ESP_LOGD("POKE", "Packet: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                           pokePacket[0], pokePacket[1], pokePacket[2], pokePacket[3],
+                           pokePacket[4], pokePacket[5], pokePacket[6], pokePacket[7],
+                           pokePacket[8], pokePacket[9], pokePacket[10], pokePacket[11],
+                           pokePacket[12], pokePacket[13], pokePacket[14], pokePacket[15]);
+                  
+                  xyeSerial.write(pokePacket, 16);
+                  xyeState.waitingForResponse = true;
+                  xyeState.commandSent = true;
+                }
+                id(poke_scan_step) = 4;
+              }
+              break;
+            }
+            
+            case 4: {
+              // Step 4: Wait for poke response
+              if (xyeState.doneReading) {
+                id(poke_scan_step) = 5;
+              }
+              break;
+            }
+            
+            case 5: {
+              // Step 5: Compare and log changes
+              bool hasChanges = false;
+              for (uint8_t i = 0; i < 30; i++) {
+                if (xyeState.recData[i] != baselineData[i]) {
+                  ESP_LOGW("POKE", "CHANGE DETECTED! Byte[%d]=0x%02X -> Response[%d]: 0x%02X -> 0x%02X",
+                           byteIdx, testValues[valIdx], i, baselineData[i], xyeState.recData[i]);
+                  hasChanges = true;
+                }
+              }
+              
+              if (!hasChanges) {
+                ESP_LOGD("POKE", "No response change for Byte[%d]=0x%02X", byteIdx, testValues[valIdx]);
+              }
+              
+              // Move to next test value
+              valIdx++;
+              if (valIdx >= numTestValues) {
+                // Move to next byte
+                valIdx = 0;
+                byteIdx++;
+                if (byteIdx > 10) {
+                  // Done!
+                  ESP_LOGW("POKE", "========== POKE & SCAN COMPLETE ==========");
+                  id(poke_scan_running) = false;
+                  id(poke_scan_step) = 0;
+                  return;
+                }
+              }
+              
+              id(poke_scan_byte_index) = byteIdx;
+              id(poke_scan_value) = valIdx;
+              id(poke_scan_step) = 3;  // Continue with next poke
+              break;
+            }
+          }

@@ -109,7 +109,7 @@ uart:
   id: mod_bus
   tx_pin: 17
   rx_pin: 16
-  baud_rate: 9600
+  baud_rate: 4800 #9600
   stop_bits: 1
 
 modbus:
